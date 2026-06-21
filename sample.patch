@@ -1,0 +1,37 @@
+diff --git a/app.py b/app.py
+index 83db48f..bf269f6 100644
+--- a/app.py
++++ b/app.py
+@@ -1,14 +1,25 @@
+ import os
++import json
+ 
+ def calculate_average(scores):
+-    return sum(scores) / len(scores)
++    total = sum(scores)
++    average = total / len(scores)
++    return average
+ 
+ def get_user_discount(user):
+-    if user.is_premium:
+-        return 0.2
+-    return 0.0
++    if user.is_premium:
++        discount = 0.2
++    else:
++        discount = 0.0
++    return discount
+ 
+ def process_order(order_id, items, user):
+-    total = sum(item.price for item in items)
+-    discount = get_user_discount(user)
+-    return total * (1 - discount)
++    total = sum(item.price for item in items)
++    discount = get_user_discount(user)
++    final_price = total * (1 - discount)
++    db.execute(f"UPDATE orders SET price={final_price} WHERE id={order_id}")
++    return final_price
++
++def fetch_user_orders(user_id):
++    query = "SELECT * FROM orders WHERE user_id = " + user_id
++    return db.execute(query)

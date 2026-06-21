@@ -1,0 +1,23 @@
+[
+    {
+        "file": "app.py",
+        "line": 24,
+        "severity": "critical",
+        "comment": "SQL injection vulnerability due to string concatenation in query",
+        "evidence": "query = \"SELECT * FROM orders WHERE user_id = \" + user_id"
+    },
+    {
+        "file": "app.py",
+        "line": 5,
+        "severity": "high",
+        "comment": "Potential ZeroDivisionError when calculating average if scores list is empty",
+        "evidence": "average = total / len(scores)"
+    },
+    {
+        "file": "app.py",
+        "line": 20,
+        "severity": "high",
+        "comment": "Potential SQL injection vulnerability due to string formatting in query",
+        "evidence": "db.execute(f\"UPDATE orders SET price={final_price} WHERE id={order_id}\")"
+    }
+]
