@@ -2,34 +2,6 @@
 
 PR Sentinel is an autonomous agent that reviews GitHub Pull Requests the way a senior engineer would. It combines deterministic static analysis (Ruff) with advanced LLM reasoning (Meta LLaMA-3.3 via Groq) to catch code style violations, logical bugs, and security risks. To guarantee reliability, the agent validates all LLM findings against the code diff before posting comments, preventing hallucinations entirely.
 
----
-
-## 🏗️ Architecture & Event Flow
-
-PR Sentinel is built as a modular system using **LangGraph** for review flow orchestration, **FastAPI** for real-time GitHub webhook handling, and **SQLAlchemy** (Postgres/SQLite) for logging.
-
-```mermaid
-graph TD
-    A[GitHub Event: PR Opened/Updated] -->|Webhook HTTP POST| B(Smee.io Proxy)
-    B -->|Stream via SSE| C(Local Smee Client)
-    C -->|Local HTTP POST| D(FastAPI Server: webhook.py)
-    
-    subgraph FastAPI Web Service
-        D -->|Verify Signature & Parse| E(BackgroundTasks Runner)
-    end
-    
-    subgraph LangGraph Pipeline
-        E -->|1. Ingest| F(Ingest Node: Parse Diff)
-        F -->|2. Lint| G(Lint Node: Run Ruff)
-        G -->|3. Reason| H(Reasoning Node: LLM Analysis)
-        H -->|4. Verify| I(Verify Node: Evidence Check)
-        I -->|5. Format| J(Format Node: Consolidate)
-    end
-    
-    J -->|Post Inline Comments| K(GitHub Pull Request)
-    J -->|Update Status Check| L(GitHub Commit Status)
-    J -->|Log Review Findings| M[(Database: Postgres/SQLite)]
-```
 
 ---
 
