@@ -135,11 +135,9 @@ This project includes a `Dockerfile` and `.dockerignore` for containerized hosti
 
 ### Building and Running the Docker Container Locally
 ```bash
-# Build the image
 docker build -t pr-sentinel .
-
-# Run the container
 docker run -p 8000:8000 --env-file .env pr-sentinel
+
 ```
 
 ### Deploying to Render
