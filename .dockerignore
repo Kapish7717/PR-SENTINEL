@@ -1,0 +1,12 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+*.pem
+pr_sentinel.db
+.git/
+.pytest_cache/
+.ruff_cache/

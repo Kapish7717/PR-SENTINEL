@@ -1,0 +1,767 @@
+================================================================================
+                     PR SENTINEL — COMPLETE PHASE-WISE BUILD PLAN
+                       Autonomous GitHub PR Review Agent
+================================================================================
+
+WHAT IS PR SENTINEL?
+--------------------
+An autonomous agent that reviews GitHub Pull Requests the way a senior engineer
+would. It runs real static analysis (ruff linter), reasons about logic and
+security issues using an LLM, verifies its own claims against the actual code
+before trusting them, and posts findings back as inline PR comments — running
+live as a GitHub App, not a local demo.
+
+TECH STACK
+----------
+- Orchestration    : LangGraph (StateGraph)
+- LLM              : Groq (llama-3.3-70b-versatile)
+- Linting          : ruff (via subprocess)
+- Codebase Search  : ChromaDB (semantic search over repo)
+- MCP Tools        : FastMCP
+- API              : FastAPI
+- Async Jobs       : Celery + Redis
+- Database         : PostgreSQL
+- Deployment       : Railway / Fly.io
+- GitHub           : GitHub App (webhooks, JWT auth)
+
+FINAL FOLDER STRUCTURE
+-----------------------
+pr-sentinel/
+├── app/
+│   ├── agent/
+│   │   ├── state.py              # ReviewState TypedDict
+│   │   ├── graph.py              # LangGraph wiring
+│   │   ├── prompts.py            # build_review_prompt
+│   │   └── nodes/
+│   │       ├── ingest.py         # parse diff
+│   │       ├── lint.py           # ruff integration
+│   │       ├── reasoning.py      # LLM call + parse
+│   │       └── verify.py         # evidence check + severity filter
+│   ├── mcp_tools/
+│   │   └── server.py             # FastMCP server exposing all tools
+│   ├── github/
+│   │   ├── webhook.py            # incoming GitHub events
+│   │   ├── auth.py               # GitHub App JWT auth
+│   │   └── client.py             # GitHub API calls
+│   ├── workers/
+│   │   └── tasks.py              # Celery async tasks
+│   ├── db/
+│   │   ├── models.py             # SQLAlchemy models
+│   │   └── session.py            # DB connection
+│   ├── api/
+│   │   └── main.py               # FastAPI entrypoint
+│   └── config.py                 # env vars / settings
+├── test_diffs/
+│   ├── sample_synthetic.patch    # bugfix + SQL injection test
+│   ├── setup_py_charset.patch    # dependency change (should return [])
+│   ├── clean_no_issues.patch     # purely clean diff
+│   └── README.md                 # what each file should / should not flag
+├── tests/
+│   ├── test_ingest.py
+│   ├── test_linter.py
+│   └── test_verification.py
+├── scripts/
+│   └── run_local_review.py       # CLI: point at a .patch file, print findings
+├── docker/
+│   ├── Dockerfile
+│   └── docker-compose.yml
+├── .env.example
+├── pyproject.toml
+├── README.md
+└── .gitignore
+
+
+================================================================================
+PHASE 1 — CORE AGENT LOGIC (COMPLETE)
+================================================================================
+
+STATUS: Done. Core loop working end-to-end and tested.
+
+WHAT WAS BUILT:
+---------------
+1. ReviewState (TypedDict) — shared clipboard passed through all nodes:
+   - raw_diff        : raw .patch text, input to the pipeline
+   - parsed_files    : clean list of {filename, added_lines, removed_lines}
+   - lint_issues     : findings from ruff (deterministic)
+   - llm_findings    : findings from LLM (reasoning-based)
+   - final_review    : merged, verified output
+
+2. LangGraph pipeline — 5 nodes wired in sequence:
+   ingest_diff → static_analysis → contextual_reasoning → aggregate_findings → format_review
+
+3. parse_with_unidiff — converts raw diff text into structured Python objects
+   using the `unidiff` library so downstream nodes work with clean data.
+
+4. build_review_prompt — constructs the LLM instruction:
+   - feeds only ADDED lines (not whole file, keeps prompt short and cheap)
+   - asks for structured JSON output: {file, line, severity, comment, evidence}
+   - explicitly says empty list is a valid, common outcome (prevents hallucination pressure)
+   - few-shot examples of what a real finding looks like vs a non-issue
+   - special guardrail for dependency/config files: only flag if syntax error,
+     impossible constraint, or known CVE — not version range changes
+
+5. call_llm — Groq API call:
+   - model: llama-3.3-70b-versatile (upgraded from 8b-instant after catching
+     reasoning failures — 8b was pattern-matching "version range = suspicious"
+     without understanding what the range actually meant)
+   - temperature: 0.2 (low randomness, consistent reviews)
+
+6. parse_llm_response — defensive parser:
+   - strips markdown code fences (```json ... ```) which models sometimes add
+   - catches JSONDecodeError and returns [] instead of crashing
+   - validates response is a list, not a dict or string
+
+7. verify_findings — evidence-grounded hallucination check:
+   - asks model to include "evidence" field: exact line from diff proving the issue
+   - get_added_lines_text: flattens one file's added lines into a single searchable string
+   - checks: evidence in file_lines → if not found, the finding is discarded
+   - this is the key production pattern: never let model output go straight to
+     user without grounding it in something verifiable
+
+8. filter_for_posting — severity filter:
+   - only pass medium/high findings to PR comments
+   - log low-severity findings internally (don't spam PRs with nitpicks)
+
+KEY DECISIONS MADE IN PHASE 1:
+-------------------------------
+- Model upgrade (8b → 70b) was higher-leverage than more prompt engineering
+  for reasoning-quality issues.
+- Evidence verification solves fabricated-claim hallucinations regardless of
+  model quality. Both layers needed — they solve different failure modes.
+- Tested against: synthetic diff (3 planted bugs), psf/requests PR #6169
+  (dependency change — correctly returned []), real agent.py (3 real lint issues).
+
+REMAINING CLEANUP:
+------------------
+- Split agent.py into the nodes/ folder structure before Phase 2 grows it further.
+- Add a clean-no-issues test case to confirm empty list is reliably returned.
+
+
+================================================================================
+PHASE 2 — REAL LINTER INTEGRATION
+================================================================================
+
+STATUS: In progress. ruff installed and tested. Integration code written.
+        3 real issues found in agent.py (2x unused import F401, 1x E402).
+
+GOAL: Replace the stubbed static_analysis node (which returns []) with real
+ruff output so lint_issues becomes genuinely populated.
+
+STEPS:
+
+2.1 Fix filename path mismatch
+-------------------------------
+ruff returns full absolute Windows paths in the "filename" field:
+  "C:\\Kapish\\PR_sentinel\\agent.py"
+But parsed_files from unidiff contains just:
+  "agent.py"
+These won't match in filter_to_changed_lines. Fix:
+
+  import os
+  normalized = os.path.basename(issue["filename"])
+
+Apply this normalization inside run_linter before appending to issues list.
+
+2.2 Map ruff severity properly
+--------------------------------
+ruff already has a "severity" field ("error" / "warning"). Don't hardcode "low".
+Map it to your scale:
+
+  severity_map = {"error": "medium", "warning": "low"}
+  severity = severity_map.get(issue.get("severity", "warning"), "low")
+
+Lint issues should never be "high" in your scale — they don't crash anything.
+"medium" for errors (unused imports, misplaced imports) is appropriate.
+
+2.3 Implement filter_to_changed_lines
+--------------------------------------
+This is the most important step. Without it, ruff will flag every pre-existing
+issue in the whole file, not just what this PR changed. That's unfair to the PR
+author — not their mess to clean up.
+
+  def filter_to_changed_lines(lint_issues, parsed_files):
+      changed_lines_by_file = {
+          f["filename"]: {line_no for line_no, _ in f["added_lines"]}
+          for f in parsed_files
+      }
+      return [
+          issue for issue in lint_issues
+          if issue["line"] in changed_lines_by_file.get(issue["file"], set())
+      ]
+
+2.4 The file-content problem
+------------------------------
+ruff needs an actual .py file on disk — it can't lint a diff snippet in memory.
+For local testing: save the "after" version of your test diff as a real .py file
+and point run_linter at it.
+
+In Phase 3 (GitHub integration), you will fetch full file content via the
+GitHub API (get_file_content tool) and write it to a temp file before linting.
+Design for this now: run_linter should accept a file_path argument, not assume
+anything about where the file is.
+
+  import tempfile
+
+  def lint_from_content(filename: str, content: str) -> list:
+      with tempfile.NamedTemporaryFile(suffix=".py", mode="w",
+                                        delete=False) as tmp:
+          tmp.write(content)
+          tmp_path = tmp.name
+      return run_linter(tmp_path, original_filename=filename)
+
+2.5 Wire into static_analysis node
+------------------------------------
+  def static_analysis(state: ReviewState) -> ReviewState:
+      all_issues = []
+      for f in state["parsed_files"]:
+          raw_issues = run_linter(f["filename"])
+          filtered = filter_to_changed_lines(raw_issues, state["parsed_files"])
+          all_issues.extend(filtered)
+      state["lint_issues"] = all_issues
+      return state
+
+2.6 Test
+---------
+- Run on your original sample.patch — confirm "import json unused" appears in
+  lint_issues (it was in the diff's added lines)
+- Run on setup_py_charset.patch — lint_issues should be [] (no Python files)
+- Run on agent.py directly — confirm 3 issues appear, then fix them in agent.py
+  and confirm it returns [] on a clean file
+
+2.7 Refactor agent.py into folder structure
+---------------------------------------------
+Split before this file grows further. Move:
+  - TypedDict → app/agent/state.py
+  - StateGraph wiring → app/agent/graph.py
+  - build_review_prompt → app/agent/prompts.py
+  - parse_with_unidiff, ingest_diff → app/agent/nodes/ingest.py
+  - run_linter, static_analysis, filter_to_changed_lines → app/agent/nodes/lint.py
+  - call_llm, parse_llm_response, contextual_reasoning → app/agent/nodes/reasoning.py
+  - verify_findings, get_added_lines_text, filter_for_posting → app/agent/nodes/verify.py
+
+ESTIMATED TIME: 1-2 days
+
+
+================================================================================
+PHASE 2.5 — MCP TOOL LAYER
+================================================================================
+
+STATUS: Not started.
+
+GOAL: Wrap your agent's capabilities as real FastMCP tools. This is what makes
+"MCP with many tools" a genuine claim on your resume, not just internal
+LangGraph orchestration. Each tool is independently callable, documented, and
+can be used by other agents or systems later.
+
+TOOLS TO BUILD (in app/mcp_tools/server.py):
+---------------------------------------------
+
+Tool 1: get_pr_diff(pr_id, repo)
+  - Fetches raw .diff text from GitHub API for a given PR
+  - Returns: raw diff string
+  - Used by: ingest_diff node
+
+Tool 2: get_file_content(path, ref, repo)
+  - Fetches full file content at a given git ref (branch/commit)
+  - Used by: lint node (needs real file, not just diff)
+  - Also used by: search_codebase tool (to index repo content)
+
+Tool 3: run_linter(filename, content)
+  - Wraps ruff in a subprocess, returns structured findings
+  - Accepts file content directly (writes to tempfile internally)
+  - Returns: list of {file, line, severity, comment}
+
+Tool 4: run_security_scan(filename, content)
+  - Runs bandit (Python) or semgrep for security-specific patterns
+  - Complements ruff (which is style/correctness focused, not security focused)
+  - Returns: list of {file, line, severity, comment}
+  - Install: pip install bandit
+
+Tool 5: search_codebase(query, repo)
+  - Embeds entire repo into ChromaDB (done once per repo, refreshed on push)
+  - Semantic search to find related functions/classes beyond the diff
+  - Example use: PR adds a function "calculate_discount" → agent searches codebase
+    for other discount-related functions to check for inconsistency
+  - This is your HybridRAG experience applied directly — dense + sparse retrieval
+  - Returns: list of relevant code snippets with file + line references
+
+Tool 6: post_review_comment(pr_id, repo, file, line, body)
+  - Posts an inline comment on a specific line of the PR via GitHub API
+  - Returns: comment URL (log for audit trail)
+
+Tool 7: set_check_status(pr_id, repo, state, description)
+  - Sets the green tick / red cross check on the PR
+  - state: "success" | "failure" | "pending"
+  - Call "pending" when review starts, "success"/"failure" when done
+
+Tool 8: get_review_history(repo, limit)
+  - Queries Postgres for past reviews on this repo
+  - Used to provide context: "this file was reviewed 3 times before, common issue was X"
+  - Turns your persistence layer into an active agent resource, not just logging
+
+HOW FastMCP WRAPS THESE:
+--------------------------
+  from fastmcp import FastMCP
+
+  mcp = FastMCP("pr-sentinel")
+
+  @mcp.tool()
+  def run_linter(filename: str, content: str) -> list:
+      """Run ruff linter on provided file content. Returns structured findings."""
+      # your existing run_linter logic here
+      ...
+
+  if __name__ == "__main__":
+      mcp.run()
+
+Your LangGraph nodes then call these tools through the MCP client, same pattern
+as your CFO Agent's MultiServerMCPClient setup.
+
+ESTIMATED TIME: 2-3 days
+
+
+================================================================================
+PHASE 3 — GITHUB INTEGRATION
+================================================================================
+
+STATUS: Not started.
+
+GOAL: Connect the agent to real GitHub events. A real PR opened on any repo
+with your app installed should automatically trigger a review.
+
+3.1 Register a GitHub App
+--------------------------
+Go to: GitHub → Settings → Developer settings → GitHub Apps → New GitHub App
+Fill in:
+  - App name: PR Sentinel
+  - Homepage URL: your deployed URL (can be placeholder for now)
+  - Webhook URL: https://your-deployed-domain.com/webhook
+  - Webhook secret: generate a random string, save in .env as GITHUB_WEBHOOK_SECRET
+  - Permissions needed:
+      Pull requests: Read & Write    (to read diffs, post comments)
+      Contents: Read                 (to fetch file content)
+      Checks: Read & Write           (to set check status green/red)
+  - Subscribe to events: Pull request
+
+Download the private key (.pem file) GitHub generates — save it securely.
+Save the App ID from the settings page.
+
+WHY A GITHUB APP AND NOT A PERSONAL TOKEN:
+- A personal token only works for your own repos
+- A GitHub App can be installed on ANY repo (yours, a friend's, a client's)
+- "Installable on any repo" is the difference between "tool I made" and "product I shipped"
+- GitHub Apps use short-lived JWT tokens (auto-refreshed) — more secure than a
+  static token sitting in your .env forever
+
+3.2 Webhook endpoint (app/github/webhook.py)
+---------------------------------------------
+  from fastapi import APIRouter, Request, HTTPException
+  import hmac, hashlib
+
+  router = APIRouter()
+
+  @router.post("/webhook")
+  async def handle_webhook(request: Request):
+      # Step 1: verify the request actually came from GitHub
+      payload = await request.body()
+      signature = request.headers.get("X-Hub-Signature-256", "")
+      secret = os.environ["GITHUB_WEBHOOK_SECRET"].encode()
+      expected = "sha256=" + hmac.new(secret, payload, hashlib.sha256).hexdigest()
+      if not hmac.compare_digest(expected, signature):
+          raise HTTPException(status_code=401, detail="Invalid signature")
+
+      # Step 2: parse event type and route
+      event = request.headers.get("X-GitHub-Event")
+      body = await request.json()
+
+      if event == "pull_request" and body["action"] in ("opened", "synchronize"):
+          pr_id = body["pull_request"]["number"]
+          repo = body["repository"]["full_name"]
+          # enqueue async job (Phase 4) — don't block the webhook response
+          review_pr.delay(pr_id, repo)
+
+      return {"status": "ok"}
+
+HMAC SIGNATURE VERIFICATION IS MANDATORY:
+Without it, anyone can send fake events to your webhook endpoint.
+Always use hmac.compare_digest (not ==) to prevent timing attacks.
+Mention this in your README and interviews — it shows production security awareness.
+
+3.3 GitHub App auth (app/github/auth.py)
+-----------------------------------------
+GitHub Apps authenticate with short-lived JWT tokens, not static API keys.
+Flow:
+  1. Sign a JWT using your App's private key + App ID (expires in 10 min)
+  2. Use that JWT to request an Installation Access Token for a specific repo
+  3. Use the Installation Access Token for all actual API calls
+  4. Refresh when it expires (they last 1 hour)
+
+  import jwt, time, requests
+
+  def get_installation_token(installation_id):
+      payload = {
+          "iat": int(time.time()),
+          "exp": int(time.time()) + 600,
+          "iss": os.environ["GITHUB_APP_ID"]
+      }
+      private_key = open("github_private_key.pem").read()
+      jwt_token = jwt.encode(payload, private_key, algorithm="RS256")
+
+      resp = requests.post(
+          f"https://api.github.com/app/installations/{installation_id}/access_tokens",
+          headers={"Authorization": f"Bearer {jwt_token}",
+                   "Accept": "application/vnd.github+json"}
+      )
+      return resp.json()["token"]
+
+3.4 GitHub API client (app/github/client.py)
+---------------------------------------------
+Wrap the common API calls your MCP tools need:
+
+  def get_pr_diff(pr_id, repo, token):
+      resp = requests.get(
+          f"https://api.github.com/repos/{repo}/pulls/{pr_id}",
+          headers={"Authorization": f"Bearer {token}",
+                   "Accept": "application/vnd.github.v3.diff"}
+      )
+      return resp.text
+
+  def post_review_comment(pr_id, repo, token, commit_sha, path, line, body):
+      requests.post(
+          f"https://api.github.com/repos/{repo}/pulls/{pr_id}/comments",
+          headers={"Authorization": f"Bearer {token}"},
+          json={"body": body, "commit_id": commit_sha,
+                "path": path, "line": line}
+      )
+
+  def set_check_status(repo, token, sha, state, description):
+      requests.post(
+          f"https://api.github.com/repos/{repo}/statuses/{sha}",
+          headers={"Authorization": f"Bearer {token}"},
+          json={"state": state, "description": description,
+                "context": "PR Sentinel"}
+      )
+
+ESTIMATED TIME: 2-3 days
+
+
+================================================================================
+PHASE 4 — ASYNC JOB PROCESSING
+================================================================================
+
+STATUS: Not started.
+
+GOAL: A PR review takes 30 seconds to 2 minutes (LLM calls, linting, API calls).
+GitHub expects your webhook to respond with HTTP 200 within ~10 seconds or it
+marks the delivery as failed. So you can't do the review inline — you respond
+immediately and process in the background.
+
+4.1 Install Celery + Redis
+---------------------------
+  pip install celery redis
+
+Redis acts as the message broker: the webhook puts a job on the queue, the
+Celery worker picks it up and runs the actual review.
+
+4.2 Define the task (app/workers/tasks.py)
+-------------------------------------------
+  from celery import Celery
+
+  celery_app = Celery("pr_sentinel",
+                       broker=os.environ["REDIS_URL"],
+                       backend=os.environ["REDIS_URL"])
+
+  @celery_app.task(bind=True, max_retries=3, default_retry_delay=30)
+  def review_pr(self, pr_id: int, repo: str):
+      try:
+          token = get_installation_token(get_installation_id(repo))
+          raw_diff = get_pr_diff(pr_id, repo, token)
+
+          # run your LangGraph agent
+          result = graph.invoke({"raw_diff": raw_diff})
+
+          # post findings back
+          for finding in result["final_review"]:
+              post_review_comment(pr_id, repo, token, ...)
+          set_check_status(repo, token, sha, "success", "Review complete")
+
+          # persist to Postgres
+          save_review(pr_id, repo, result["final_review"])
+
+      except Exception as exc:
+          set_check_status(repo, token, sha, "failure", "Review failed")
+          raise self.retry(exc=exc)
+
+KEY POINTS:
+- max_retries=3: if the LLM call or a GitHub API call fails transiently, retry
+  automatically up to 3 times — don't just silently drop the review
+- Always set check status to "failure" if something goes wrong so the PR author
+  knows the review didn't complete, rather than hanging on "pending" forever
+- bind=True: lets the task access self for retry logic
+
+4.3 Webhook just enqueues, doesn't wait
+-----------------------------------------
+  # in webhook.py:
+  review_pr.delay(pr_id, repo)   # returns immediately
+  return {"status": "ok"}        # GitHub gets its 200 right away
+
+ESTIMATED TIME: 1-2 days
+
+
+================================================================================
+PHASE 5 — PERSISTENCE
+================================================================================
+
+STATUS: Not started.
+
+GOAL: Log every review to Postgres so you have real metrics, can build a
+dashboard later, and can use review history as active agent context (Tool 8 in
+Phase 2.5).
+
+5.1 Models (app/db/models.py)
+-------------------------------
+  from sqlalchemy import Column, Integer, String, JSON, DateTime
+  from sqlalchemy.ext.declarative import declarative_base
+  Base = declarative_base()
+
+  class Review(Base):
+      __tablename__ = "reviews"
+      id          = Column(Integer, primary_key=True)
+      pr_id       = Column(Integer)
+      repo        = Column(String)
+      verdict     = Column(String)           # "issues_found" / "clean"
+      findings    = Column(JSON)             # full list of findings
+      reviewed_at = Column(DateTime)
+      model_used  = Column(String)           # track which model produced this
+
+  class Finding(Base):
+      __tablename__ = "findings"
+      id          = Column(Integer, primary_key=True)
+      review_id   = Column(Integer)
+      file        = Column(String)
+      line        = Column(Integer)
+      severity    = Column(String)
+      comment     = Column(String)
+      evidence    = Column(String)
+      was_valid   = Column(Boolean, nullable=True)   # for future human feedback
+
+5.2 Why track model_used and was_valid?
+-----------------------------------------
+model_used: when you upgrade models in future (or do A/B testing between
+  model versions), you can query "which model had fewer false positives"
+  against real data rather than guessing.
+
+was_valid: optional field for future where a human can mark findings as
+  genuine or false positives. Over time this becomes a feedback dataset.
+  Not needed at launch, but designing the column in now costs nothing.
+
+ESTIMATED TIME: 1 day
+
+
+================================================================================
+PHASE 6 — DEPLOYMENT
+================================================================================
+
+STATUS: Not started.
+
+GOAL: Live, publicly reachable deployment so GitHub can actually POST events
+to your webhook. This is what makes the project "deployed" and not a demo.
+
+WHY NOT HUGGING FACE SPACES:
+Hugging Face Spaces is built for UI demos — it can sleep when idle, doesn't
+support multi-process deploys (you need FastAPI + Celery worker + Redis +
+Postgres running simultaneously), and isn't set up for long-running background
+workers. Use Railway or Fly.io instead.
+
+6.1 Docker Compose (for local dev)
+------------------------------------
+  # docker/docker-compose.yml
+  version: "3.9"
+  services:
+    api:
+      build: .
+      ports: ["8000:8000"]
+      env_file: .env
+      depends_on: [redis, postgres]
+
+    worker:
+      build: .
+      command: celery -A app.workers.tasks worker --loglevel=info
+      env_file: .env
+      depends_on: [redis, postgres]
+
+    redis:
+      image: redis:7-alpine
+
+    postgres:
+      image: postgres:15
+      environment:
+        POSTGRES_DB: pr_sentinel
+        POSTGRES_USER: postgres
+        POSTGRES_PASSWORD: password
+      volumes:
+        - postgres_data:/var/lib/postgresql/data
+
+  volumes:
+    postgres_data:
+
+This gives you full local parity with production — same containers,
+same environment — before you push anything live.
+
+6.2 Dockerfile
+---------------
+  FROM python:3.11-slim
+  WORKDIR /app
+  RUN pip install ruff bandit    # linters must be in the image, not just dev env
+  COPY pyproject.toml .
+  RUN pip install -e .
+  COPY . .
+  CMD ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+6.3 Deploy to Railway
+----------------------
+Railway supports Docker Compose-style multi-service deploys from a GitHub repo.
+Steps:
+  1. Push your repo to GitHub
+  2. Go to railway.app → New Project → Deploy from GitHub repo
+  3. Railway auto-detects docker-compose.yml and deploys all services
+  4. Add environment variables in Railway's dashboard (GROQ_API_KEY, GITHUB_APP_ID, etc.)
+  5. Railway gives you a public URL — use this as your GitHub App's webhook URL
+  6. Update your GitHub App's webhook URL to point to this domain
+
+6.4 Health endpoint
+---------------------
+Add to FastAPI before deploying:
+  @app.get("/health")
+  def health():
+      return {"status": "ok", "model": os.environ.get("GROQ_MODEL")}
+
+Railway uses this to confirm your service is running.
+Also useful in interviews: "the app has a health endpoint and structured logging."
+
+6.5 Environment variables needed
+----------------------------------
+  GROQ_API_KEY=
+  GITHUB_APP_ID=
+  GITHUB_WEBHOOK_SECRET=
+  GITHUB_PRIVATE_KEY_PATH=
+  REDIS_URL=redis://redis:6379/0
+  DATABASE_URL=postgresql://postgres:password@postgres:5432/pr_sentinel
+  GROQ_MODEL=llama-3.3-70b-versatile
+  MIN_SEVERITY_TO_POST=medium
+
+ESTIMATED TIME: 1-2 days
+
+
+================================================================================
+PHASE 7 — POLISH AND DEMO
+================================================================================
+
+STATUS: Not started.
+
+GOAL: Make the project maximally credible to a recruiter or interviewer who
+visits your GitHub repo and spends 3-5 minutes looking at it.
+
+7.1 README.md
+--------------
+Structure:
+  - One-paragraph description of what the project does and why
+  - Architecture diagram (draw.io or Mermaid — Mermaid renders natively in GitHub)
+  - How it works: the 5-step flow in plain English
+  - Screenshots / GIF of a real PR getting reviewed
+  - How to install the GitHub App on your own repo
+  - Tech stack list with brief justification for each choice
+  - Known limitations + future improvements (shows maturity — you understand
+    what the project can't do yet, which is more impressive than overselling it)
+
+7.2 Demo
+---------
+- Create a test repo on your GitHub account: "pr-sentinel-test-repo"
+- Install your GitHub App on it
+- Open a PR with one or two deliberately planted bugs
+  (use a variation of your sample.patch — unused import + SQL injection)
+- Let PR Sentinel comment on it live
+- Record a 60-90 second screen recording or GIF
+- Put it at the top of your README
+
+This is your single highest-ROI polish step. "Agent that reviews real PRs on
+GitHub" with a live demo video is instantly understandable and impressive to any
+recruiter, regardless of their technical depth.
+
+7.3 test_diffs/ README
+------------------------
+In test_diffs/README.md, document your regression test set:
+  - sample_synthetic.patch     → should flag: ZeroDivisionError, 2x SQL injection
+  - setup_py_charset.patch     → should flag: nothing (clean dependency update)
+  - clean_no_issues.patch      → should flag: nothing
+  - (add more real-world cases as you find them)
+
+"Validated against a curated regression test set of real-world PR diffs" is a
+strong line in your README and a great thing to mention in interviews.
+
+7.4 Resume bullet (final form)
+---------------------------------
+Built PR Sentinel, an autonomous GitHub PR review agent using LangGraph +
+FastMCP (8 tools: linting, security scanning, LLM-based reasoning, evidence-
+grounded hallucination filtering, semantic codebase search via ChromaDB).
+Deployed as a GitHub App with async job processing (Celery/Redis) and persistent
+review history (Postgres). Live on Railway — reviews real PRs with inline
+GitHub comments and check-status integration.
+
+ESTIMATED TIME: 1 day
+
+
+================================================================================
+FULL TIMELINE
+================================================================================
+
+Phase 1    Core agent logic          COMPLETE
+Phase 2    Real linter               1-2 days   ← you are here
+Phase 2.5  MCP tool layer            2-3 days
+Phase 3    GitHub integration        2-3 days
+Phase 4    Async processing          1-2 days
+Phase 5    Persistence               1 day
+Phase 6    Deployment                1-2 days
+Phase 7    Polish + demo             1 day
+                                    ----------
+           Total remaining           9-14 days
+
+Suggested approach given your Juspay OA and placement prep:
+- This week: finish Phase 2 + refactor folder structure
+- After OA: Phase 2.5 + 3 (the most interesting engineering work)
+- Weekend sprint: Phase 4 + 5 + 6 (plumbing, but finishes the project)
+- Final day: Phase 7 (README + demo video)
+
+
+================================================================================
+COMMON PITFALLS TO AVOID
+================================================================================
+
+1. NEVER trust LLM output without verification
+   Always run findings through verify_findings before posting to a PR.
+   A hallucinated "SQL injection" comment on clean code will get your app
+   uninstalled immediately.
+
+2. NEVER skip HMAC verification on the webhook
+   Without it, anyone can POST fake events to your endpoint.
+
+3. NEVER use a personal access token for GitHub auth
+   Use the GitHub App JWT flow. Personal tokens only work on your own repos
+   and are a security risk if leaked.
+
+4. DON'T flag pre-existing lint issues
+   Use filter_to_changed_lines so you only comment on what this PR introduced,
+   not problems that existed before the author touched the file.
+
+5. DON'T block the webhook response
+   Use Celery to process the review asynchronously. GitHub will mark your
+   webhook as failed if you don't respond within ~10 seconds.
+
+6. DON'T deploy to Hugging Face Spaces
+   It doesn't support always-on multi-process Docker deploys.
+   Use Railway or Fly.io.
+
+
+================================================================================
+END OF PLAN
+================================================================================

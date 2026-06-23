@@ -1,5 +1,3 @@
-import subprocess
-import json
 
 
 def get_added_lines_text(parsed_files: list, filename: str) -> str:
