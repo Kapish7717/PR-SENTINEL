@@ -1,6 +1,4 @@
 
-
-
 def build_review_prompt(parsed_files:list)->str:
     diff_text=""
     for f in parsed_files:

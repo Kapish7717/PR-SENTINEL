@@ -10,6 +10,8 @@ env/
 
 # Environment variables
 .env
+*.pem
+*.db
 
 # Ruff cache
 .ruff_cache/
