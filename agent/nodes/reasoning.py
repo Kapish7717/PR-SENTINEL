@@ -5,9 +5,20 @@ import re
 from ..state import ReviewState
 from ..prompts import build_review_prompt
 
-client = Groq(api_key=os.environ['GROQ_API_KEY'])
+# Initialize client lazily to prevent KeyError on module import when key is missing
+_client = None
+
+def get_groq_client():
+    global _client
+    if _client is None:
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise ValueError("GROQ_API_KEY environment variable is not set.")
+        _client = Groq(api_key=api_key)
+    return _client
 
 def call_llm(prompt:str)->str:
+    client = get_groq_client()
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
