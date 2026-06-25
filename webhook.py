@@ -82,4 +82,11 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "db_url": os.environ.get("DATABASE_URL", "sqlite:///./pr_sentinel.db").split("@")[-1]}  # redact auth details
+    return {
+        "status": "ok",
+        "has_groq_key": bool(os.environ.get("GROQ_API_KEY")),
+        "has_github_token": bool(os.environ.get("GITHUB_TOKEN")),
+        "has_github_app_id": bool(os.environ.get("GITHUB_APP_ID")),
+        "has_webhook_secret": bool(os.environ.get("GITHUB_WEBHOOK_SECRET")),
+        "db_url": os.environ.get("DATABASE_URL", "sqlite:///./pr_sentinel.db").split("@")[-1]
+    }
